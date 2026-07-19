@@ -1,0 +1,9 @@
+fastapi
+yfinance
+pandas
+numpy
+ta
+requests
+beautifulsoup4
+groq
+python-dotenv

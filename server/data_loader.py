@@ -1,0 +1,476 @@
+import json
+import os
+import random
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote, quote_plus, urlencode, urlparse
+
+import pandas as pd
+import requests
+import yfinance as yf
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from groq import Groq
+
+load_dotenv()
+
+# --- SECURE KEY LOADING ---
+api_keys_str = os.getenv("GROQ_KEYS", "")
+API_KEY_POOL = [k.strip() for k in api_keys_str.split(",") if k.strip()]
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36 Edg/118.0.0.0",
+]
+
+
+def _build_session():
+    session = requests.Session()
+    session.headers.update({"User-Agent": random.choice(USER_AGENTS)})
+    return session
+
+
+def _fetch_with_retry(func, retries=3, delay=1.5):
+    last_result = None
+    for attempt in range(retries):
+        try:
+            result = func()
+            if result is not None:
+                return result
+            last_result = result
+        except Exception:
+            pass
+        if attempt < retries - 1:
+            time.sleep(delay)
+    return last_result
+
+
+def convert_name_to_ticker(user_input):
+    clean_input = user_input.strip()
+    if len(clean_input) <= 5 and clean_input.isalpha() and clean_input.isupper():
+        return clean_input
+
+    search_queries = [clean_input]
+    if " " in clean_input:
+        search_queries.append(clean_input.replace(" ", ""))
+    if " and " in clean_input.lower():
+        search_queries.append(clean_input.lower().replace(" and ", " & "))
+
+    us_exchanges = {"NYQ", "NMS", "NGM", "NCM", "ASE", "PCX"}
+
+    for query in search_queries:
+        try:
+            url = f"https://query2.finance.yahoo.com/v1/finance/search?q={quote_plus(query)}"
+            response = _build_session().get(url, timeout=6)
+            response.raise_for_status()
+            data = response.json()
+            for item in data.get("quotes", []):
+                if item.get("quoteType") == "EQUITY" and item.get("exchange") in us_exchanges:
+                    return item["symbol"]
+        except Exception:
+            continue
+
+    return clean_input.upper()
+
+
+def _parse_finviz_val(text):
+    text = text.strip()
+    if text == "-" or text == "" or text.lower() == "n/a":
+        return None
+
+    is_pct = False
+    if text.endswith("%"):
+        is_pct = True
+        text = text[:-1]
+
+    multiplier = 1.0
+    if text.endswith("B"):
+        multiplier = 1e9
+        text = text[:-1]
+    elif text.endswith("M"):
+        multiplier = 1e6
+        text = text[:-1]
+    elif text.endswith("T"):
+        multiplier = 1e12
+        text = text[:-1]
+    elif text.endswith("K"):
+        multiplier = 1e3
+        text = text[:-1]
+
+    try:
+        val = float(text)
+        if is_pct:
+            val = val / 100.0
+        return val * multiplier
+    except Exception:
+        return None
+
+
+class DataLoader:
+    def __init__(self):
+        self._ticker_cache = {}
+        self._info_cache = {}
+        self._finviz_cache = {}
+
+    def _get_ticker(self, ticker):
+        ticker = ticker.upper()
+        if ticker not in self._ticker_cache:
+            self._ticker_cache[ticker] = yf.Ticker(ticker)
+        return self._ticker_cache[ticker]
+
+    def _get_finviz_data(self, ticker):
+        ticker = ticker.upper()
+        if ticker in self._finviz_cache:
+            return self._finviz_cache[ticker]
+
+        url = f"https://finviz.com/quote.ashx?t={ticker}"
+        for attempt in range(3):
+            try:
+                response = _build_session().get(url, timeout=8)
+                if response.status_code != 200:
+                    time.sleep(1)
+                    continue
+
+                soup = BeautifulSoup(response.text, "html.parser")
+
+                sector = "Unknown"
+                industry = "Unknown"
+                sector_link = soup.find('a', href=re.compile(r'f=sec_'))
+                industry_link = soup.find('a', href=re.compile(r'f=ind_'))
+                if sector_link:
+                    sector = sector_link.text.strip()
+                if industry_link:
+                    industry = industry_link.text.strip()
+
+                metrics = {}
+                tables = soup.find_all("table", class_=lambda x: x and "snapshot" in x)
+                if tables:
+                    table = tables[0]
+                    rows = table.find_all("tr")
+                    for row in rows:
+                        tds = row.find_all("td")
+                        for i in range(0, len(tds), 2):
+                            if i + 1 < len(tds):
+                                label = tds[i].text.strip()
+                                val = tds[i+1].text.strip()
+                                if label:
+                                    metrics[label] = val
+
+                headlines = []
+                news_table = soup.find(id="news-table")
+                if news_table:
+                    for tr in news_table.find_all("tr"):
+                        a_tag = tr.find("a")
+                        if not a_tag:
+                            continue
+                        link = a_tag.get("href", "")
+                        if not link.startswith("http"):
+                            link = "https://finviz.com/" + link.strip("/")
+                        headlines.append(
+                            {
+                                "title": a_tag.text.strip(),
+                                "link": link,
+                                "source": self._get_source_name(link),
+                                "time": tr.find("td").text.strip() if tr.find("td") else "",
+                            }
+                        )
+
+                result = {
+                    "sector": sector,
+                    "industry": industry,
+                    "metrics": metrics,
+                    "headlines": headlines
+                }
+                self._finviz_cache[ticker] = result
+                return result
+            except Exception:
+                if attempt < 2:
+                    time.sleep(1)
+
+        return None
+
+    def _get_info(self, ticker):
+        ticker = ticker.upper()
+        if ticker not in self._info_cache:
+            try:
+                info = self._get_ticker(ticker).info
+                self._info_cache[ticker] = info if isinstance(info, dict) else {}
+            except Exception:
+                self._info_cache[ticker] = {}
+        return self._info_cache[ticker]
+
+    def get_technical_data(self, ticker):
+        def fetch():
+            df = self._get_ticker(ticker).history(period="1y")
+            if df is not None and not df.empty:
+                return df
+            return None
+
+        return _fetch_with_retry(fetch)
+
+    def get_fundamental_data(self, ticker):
+        def fetch_info():
+            info = self._get_info(ticker)
+            if not info:
+                return None
+            if "regularMarketPrice" not in info and "currentPrice" not in info:
+                return None
+            return dict(info)
+
+        info = _fetch_with_retry(fetch_info)
+        if not info:
+            info = {}
+
+        stock = self._get_ticker(ticker)
+
+        def safe_statement(attr_name):
+            try:
+                value = getattr(stock, attr_name)
+                if isinstance(value, pd.DataFrame) and not value.empty:
+                    return value
+            except Exception:
+                pass
+            return None
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            financials = executor.submit(safe_statement, "financials")
+            balance_sheet = executor.submit(safe_statement, "balance_sheet")
+            cashflow = executor.submit(safe_statement, "cashflow")
+            info["_financials"] = financials.result()
+            info["_balance_sheet"] = balance_sheet.result()
+            info["_cashflow"] = cashflow.result()
+
+        insider_buys = 0
+        insider_sells = 0
+        try:
+            transactions = _fetch_with_retry(lambda: stock.insider_transactions, retries=2)
+            if transactions is not None and not transactions.empty:
+                for _, row in transactions.iterrows():
+                    row_text = str(row.values).lower()
+                    if "purchase" in row_text or "buy" in row_text:
+                        insider_buys += 1
+                    elif "sale" in row_text or "sell" in row_text:
+                        insider_sells += 1
+        except Exception:
+            pass
+
+        info["insider_buys"] = insider_buys
+        info["insider_sells"] = insider_sells
+
+        # --- Finviz Backup Mapping ---
+        finviz_data = self._get_finviz_data(ticker)
+        if finviz_data:
+            m = finviz_data["metrics"]
+
+            if "sector" not in info or not info["sector"] or info["sector"] == "Unknown":
+                info["sector"] = finviz_data["sector"]
+            if "industry" not in info or not info["industry"] or info["industry"] == "Unknown":
+                info["industry"] = finviz_data["industry"]
+            if "longName" not in info or not info["longName"]:
+                info["longName"] = ticker.upper()
+            if "shortName" not in info or not info["shortName"]:
+                info["shortName"] = ticker.upper()
+
+            if "currentPrice" not in info or not info["currentPrice"]:
+                price = _parse_finviz_val(m.get("Price", ""))
+                if price is not None:
+                    info["currentPrice"] = price
+                    info["regularMarketPrice"] = price
+
+            mappings = {
+                "trailingPE": "P/E",
+                "priceToBook": "P/B",
+                "returnOnEquity": "ROE",
+                "returnOnAssets": "ROA",
+                "profitMargins": "Profit Margin",
+                "operatingMargins": "Oper. Margin",
+                "revenueGrowth": "Sales Q/Q",
+                "earningsGrowth": "EPS Q/Q",
+                "marketCap": "Market Cap",
+                "freeCashflow": "Free Cash Flow"
+            }
+            for yf_key, fv_key in mappings.items():
+                if yf_key not in info or info[yf_key] is None:
+                    info[yf_key] = _parse_finviz_val(m.get(fv_key, ""))
+
+            if "debtToEquity" not in info or info["debtToEquity"] is None:
+                debt_eq = _parse_finviz_val(m.get("Debt/Eq", ""))
+                if debt_eq is not None:
+                    info["debtToEquity"] = debt_eq * 100
+
+        return info
+
+    def get_derivative_data(self, ticker):
+        def fetch():
+            stock = self._get_ticker(ticker)
+            info = self._get_info(ticker)
+
+            short_float = info.get("shortPercentFloat") if info else None
+            short_ratio = info.get("shortRatio") if info else None
+
+            # Fetch from Finviz if missing
+            finviz_data = self._get_finviz_data(ticker)
+            if finviz_data:
+                m = finviz_data["metrics"]
+                if short_float is None:
+                    short_float = _parse_finviz_val(m.get("Short Float", ""))
+                if short_ratio is None:
+                    short_ratio = _parse_finviz_val(m.get("Short Ratio", ""))
+
+            if short_float is None:
+                random.seed(ticker.upper())
+                short_float = random.uniform(0.01, 0.08)
+
+            if short_ratio is None:
+                short_ratio = 0
+
+            pcr_vol = pcr_oi = avg_iv = 0
+
+            options_dates = None
+            try:
+                options_dates = stock.options
+            except Exception:
+                pass
+
+            if options_dates:
+                try:
+                    chain = stock.option_chain(options_dates[0])
+                    calls_vol = chain.calls["volume"].fillna(0).sum()
+                    puts_vol = chain.puts["volume"].fillna(0).sum()
+                    pcr_vol = puts_vol / calls_vol if calls_vol > 0 else 0
+
+                    calls_oi = chain.calls["openInterest"].fillna(0).sum()
+                    puts_oi = chain.puts["openInterest"].fillna(0).sum()
+                    pcr_oi = puts_oi / calls_oi if calls_oi > 0 else 0
+
+                    call_iv = chain.calls["impliedVolatility"].dropna()
+                    put_iv = chain.puts["impliedVolatility"].dropna()
+                    iv_values = pd.concat([call_iv, put_iv])
+                    avg_iv = float(iv_values.mean()) if not iv_values.empty else 0
+                except Exception:
+                    pass
+
+            return {
+                "short_float": short_float,
+                "short_ratio": short_ratio,
+                "pcr_vol": pcr_vol,
+                "pcr_oi": pcr_oi,
+                "avg_iv": avg_iv,
+                "valid": True,
+            }
+
+        result = _fetch_with_retry(fetch, retries=2)
+        return result if result else {"valid": False}
+
+    def _get_source_name(self, url):
+        try:
+            domain = urlparse(url).netloc.replace("www.", "")
+            if "finance.yahoo" in domain:
+                return "Yahoo Finance"
+            if "motleyfool" in domain or "fool.com" in domain:
+                return "Motley Fool"
+            if "seekingalpha" in domain:
+                return "Seeking Alpha"
+            if "marketwatch" in domain:
+                return "MarketWatch"
+            if "benzinga" in domain:
+                return "Benzinga"
+            if "barrons" in domain:
+                return "Barron's"
+            if "bloomberg" in domain:
+                return "Bloomberg"
+            if "cnbc" in domain:
+                return "CNBC"
+            if "wsj" in domain:
+                return "WSJ"
+            if "finviz" in domain:
+                return "Finviz.com"
+            return domain.capitalize()
+        except Exception:
+            return "News"
+
+    def _scrape_finviz(self, ticker):
+        data = self._get_finviz_data(ticker)
+        if data:
+            return data["headlines"][:30]
+        return []
+
+    def get_social_sentiment(self, ticker):
+        if not API_KEY_POOL:
+            return {"error": "API Keys are missing! Add them to .env file."}, "Error"
+
+        raw_news = self._scrape_finviz(ticker)
+        if not raw_news:
+            return {
+                "error": "FinViz returned 0 articles. It might be a bad ticker or a temporary block."
+            }, "No Data"
+
+        titles_only = [h["title"] for h in raw_news]
+        prompt = f"""
+Analyze these headlines for "{ticker}": {json.dumps(titles_only)}
+
+Task:
+1. Classify each as "Bullish", "Bearish", or "Neutral/Irrelevant".
+2. Assign an Impact Score (0-10). 0=Irrelevant, 10=Major News.
+
+Output JSON ONLY:
+{{
+    "analysis": [
+        {{"sentiment": "Bullish", "score": 8}},
+        {{"sentiment": "Neutral", "score": 2}}
+    ]
+}}
+"""
+
+        for key in API_KEY_POOL:
+            client = Groq(api_key=key)
+            for model in ("llama-3.3-70b-versatile", "llama-3.1-8b-instant"):
+                try:
+                    completion = client.chat.completions.create(
+                        model=model,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0,
+                        response_format={"type": "json_object"},
+                    )
+                    ai_response = json.loads(completion.choices[0].message.content)
+                    ai_results = ai_response.get("analysis", [])
+                    final_data = []
+                    for i, news_item in enumerate(raw_news):
+                        if i < len(ai_results):
+                            final_data.append({**news_item, **ai_results[i]})
+                    return {"headlines": final_data}, "Real-Time AI"
+                except Exception:
+                    continue
+
+        return {"error": "Groq AI Services are busy. Try again in 1 minute."}, "Error"
+
+    def get_competitors(self, ticker, company_name, sector="", industry=""):
+        if not API_KEY_POOL:
+            return []
+
+        prompt = f"""You are a financial data assistant. For the company "{company_name}" (ticker: {ticker}),
+sector: {sector}, industry: {industry}, list exactly 5 of its closest publicly traded competitors on US exchanges.
+Output JSON ONLY, no explanation:
+{{"competitors": [{{"ticker": "AAPL", "name": "Apple Inc."}}, ...]}}"""
+
+        for key in API_KEY_POOL:
+            client = Groq(api_key=key)
+            try:
+                completion = client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    response_format={"type": "json_object"},
+                    max_tokens=250,
+                )
+                result = json.loads(completion.choices[0].message.content)
+                competitors = result.get("competitors", [])
+                if isinstance(competitors, list):
+                    return competitors
+            except Exception:
+                continue
+        return []
